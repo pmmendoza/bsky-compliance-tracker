@@ -1,0 +1,36 @@
+flowchart TD
+    start([CLI Run])
+    fetch[Fetch subscriber engagements\nfor monitored posts]
+    storeEng[store_engagements\npersist rows]
+    engagements[(engagements table)]
+    fetchFeed[Fetch feed retrieval compliance events]
+    storeFeed[store_feed_retrievals\npersist requests/posts]
+    feedRequests[(feed_requests table)]
+    feedPosts[(feed_request_posts table)]
+    match[match_post_positions\nbatch matcher]
+    decision1{Feed request\nbefore engagement?}
+    statusNoFeed[Set position_status=\nPOSITION_STATUS_NO_FEED]
+    decision2{Feed snapshot valid?}
+    statusInvalid[Set position_status to\nINVALID_TS / INVALID_FEED_TS /\nFEED_IN_FUTURE / EMPTY_FEED]
+    decision3{Post URI present\nin snapshot?}
+    statusMissing[Set position_status=\nPOSITION_STATUS_POST_MISSING]
+    update[Update post_position,\nposition_feed_request_id,\nposition_age_seconds,\nposition_status=MATCHED]
+    summary[CLI reports stats\nand logs outcomes]
+
+    start --> fetch --> storeEng --> engagements
+    start --> fetchFeed --> storeFeed
+    storeFeed --> feedRequests
+    storeFeed --> feedPosts
+    engagements --> match
+    feedRequests --> match
+    feedPosts --> match
+    match --> decision1
+    decision1 -- "No" --> statusNoFeed --> summary
+    decision1 -- "Yes" --> decision2
+    decision2 -- "No" --> statusInvalid --> summary
+    decision2 -- "Yes" --> decision3
+    decision3 -- "No" --> statusMissing --> summary
+    decision3 -- "Yes" --> update --> summary
+
+    classDef process fill:#ECF2FF,stroke:#4C5BD4,stroke-width:2px;
+    class start,fetch,storeEng,fetchFeed,storeFeed,match,update,summary process;

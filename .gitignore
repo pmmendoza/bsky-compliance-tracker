@@ -1,1 +1,11 @@
 .DS_Store
+.env
+db_update_log.jsonl
+project_dev/
+__pycache__/
+.pytest_cache/
+compliance.db
+engagement.db
+feed-retrieval.db
+compliance-backup_2025-10-06.db
+compliance-backup_20251006.db
