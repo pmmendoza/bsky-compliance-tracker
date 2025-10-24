@@ -10,6 +10,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import requests
 
 from .constants import (
+    APPVIEW_BASE,
     FEED_COMPLIANCE_ENDPOINT,
     SUBSCRIBER_HOST_ENV,
     SUBSCRIBER_KEY_ENV,
@@ -58,6 +59,42 @@ def fetch_subscribers(env: Dict[str, str]) -> Tuple[set, Dict[str, str]]:
             if handle:
                 handles[did] = handle
     return dids, handles
+
+
+def fetch_follow_counts(
+    dids: Iterable[str],
+    *,
+    timeout: float = 10.0,
+    pause_seconds: float = 0.2,
+) -> Tuple[Dict[str, int], Dict[str, str]]:
+    """Fetch the current followsCount for each DID via the public AppView API."""
+
+    session = requests.Session()
+    session.headers.setdefault("User-Agent", USER_AGENT)
+    endpoint = f"{APPVIEW_BASE}/xrpc/app.bsky.actor.getProfile"
+    counts: Dict[str, int] = {}
+    errors: Dict[str, str] = {}
+    did_list = list(dids)
+    for idx, did in enumerate(did_list):
+        try:
+            response = session.get(endpoint, params={"actor": did}, timeout=timeout)
+            response.raise_for_status()
+            payload = response.json()
+        except requests.exceptions.RequestException as exc:  # type: ignore[attr-defined]
+            errors[did] = str(exc)
+            payload = None
+        except json.JSONDecodeError as exc:
+            errors[did] = f"invalid JSON: {exc}"
+            payload = None
+        if payload:
+            follow_count = payload.get("followsCount")
+            if isinstance(follow_count, int):
+                counts[did] = follow_count
+            else:
+                errors[did] = "missing followsCount"
+        if pause_seconds and idx + 1 < len(did_list):
+            time.sleep(pause_seconds)
+    return counts, errors
 
 
 def fetch_feed_retrievals(

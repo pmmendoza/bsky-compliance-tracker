@@ -5,7 +5,7 @@ This document explains how subscriber engagements are enriched with the position
 ## Data Sources
 - **Engagements (`engagements` table)** – created in `store_engagements` when the CLI records likes, reposts, comments, and quotes. Each row is keyed by engagement timestamp, engaging DID, post URI, and engagement type, and notes whether the engager was a subscriber.
 - **Feed retrievals (`feed_requests` table)** – captured via `store_feed_retrievals`, which ingests feed compliance events and keeps a JSON snapshot of the posts returned for each request.
-- **Feed request posts (`feed_request_posts` table)** – populated alongside `feed_requests`. Each post from a retrieval gets a zero-based `post_index`, preserving the order provided by the feed generator for later lookup.
+- **Feed request posts (`feed_request_posts` table)** – populated alongside `feed_requests`. Each post stores the feed payload’s reported `position` as `post_index`; when the payload omits a position the column remains empty so downstream checks can flag the gap. The original JSON snapshot is retained for auditing.
 
 ## Matching Workflow
 1. `compliance_tracker.cli.main` orchestrates collection. After fetching engagements and feed retrievals (and optional empty-feed repairs), it calls `match_post_positions`.
@@ -37,3 +37,4 @@ Successful matches populate the following `engagements` columns:
 - `position_status` – set to `POSITION_STATUS_MATCHED`.
 
 The CLI summarises results (matched vs processed, unmatched reasons, and average delay) before exiting, providing operators with quick feedback on timeline coverage.
+- **Maintenance** – After the schema update, new feed payloads leave `post_index` empty when the feed omits `position`. Run `backfill_post_indices.py` to fill in rows once corrected payloads are available, then re-run `match_post_positions` across historical engagements.

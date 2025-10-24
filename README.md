@@ -34,7 +34,7 @@ The script will also respect the same variables already present in the process e
 ## Running the Collector
 Install dependencies (`requests`, `pytest`, and optionally `tqdm`) in your Python environment, then run for example:
 ```
-python compliance-tracker/collect_engagements.py --days 2 --db compliance-tracker/compliance.db
+python collect_engagements.py --days 2 --db compliance.db
 ```
 Key CLI options:
 - `--days`: Engagement lookback window (fractional days allowed). If omitted, the collector resumes where the last engagement run left off.
@@ -83,15 +83,30 @@ Run `python compliance-tracker/collect_engagements.py --help` for the full list.
 ### feed_request_posts
 | Column | Type | Notes |
 | --- | --- | --- |
+| id | INTEGER | Surrogate primary key |
 | request_id | INTEGER | Foreign key to `feed_requests.request_id` |
-| post_index | INTEGER | Zero-based position of the post in the response |
+| post_index | INTEGER | Zero-based position reported by the payload (nullable when missing) |
 | post_uri | TEXT | AT URI of the delivered post |
-| post_author_did | TEXT | DID of the post author |
-| post_author_handle | TEXT | Handle of the post author |
 | post_json | TEXT | Raw JSON payload |
 
-- Primary key `(request_id, post_index)`.
+- Unique constraint `(request_id, post_uri)` ensures the latest payload entry per request replaces older copies.
+- Index: `idx_feed_request_posts_request_uri`.
 - Foreign key `request_id` → `feed_requests(request_id)` with `ON DELETE CASCADE`.
+
+### posts
+| Column | Type | Notes |
+| --- | --- | --- |
+| post_uri | TEXT | Primary key; AT URI of the post |
+| cid | TEXT | Content ID when known |
+| author_did | TEXT | DID of the post author (hydrated) |
+| author_handle | TEXT | Handle of the post author (hydrated) |
+| indexed_at | TEXT | AppView index timestamp |
+| created_at | TEXT | Original `createdAt` timestamp |
+| last_hydrated_at | TEXT | UTC timestamp of the last hydrate attempt |
+| hydration_status | TEXT | `ok`, `pending`, `not_found`, or `error` |
+| hydration_error | TEXT | Last error message (nullable) |
+
+- Indexes: `idx_posts_author_did`, `idx_posts_hydration_status`.
 
 ### subscriber_snapshots
 | Column | Type | Notes |
@@ -106,6 +121,21 @@ Run `python compliance-tracker/collect_engagements.py --help` for the full list.
 ## Logging
 - `db_update_log.jsonl` contains a JSON entry per database write recording the table, counts, and affected identifiers.
 - At startup the collector logs the latest engagement and feed-retrieval timestamps (including days since) and, when more than four days of data would be fetched or no history exists, asks for confirmation before proceeding.
+
+## Follower tracking
+- Latest follower counts per subscriber DID:
+  ```sql
+  SELECT did, following_count
+  FROM subscriber_follow_counts
+  WHERE (did, snapshot_ts) IN (
+      SELECT did, MAX(snapshot_ts)
+      FROM subscriber_follow_counts
+      GROUP BY did
+  )
+  ORDER BY following_count DESC;
+  ```
+- To inspect history for a specific subscriber, run `./follower_history.py --did <DID>` (defaults to the project `compliance.db`).
+- API prerequisites: the follower fetcher requires `FEEDGEN_LISTENHOST` and `PRIORITIZE_API_KEY` to be present in the environment or `.env` file; the collector enforces a 0.2 s pause between profile requests to stay within the public Bluesky rate limit (~3,000 calls / 5 minutes).
 - The collector prints progress bars using `tqdm` when available, otherwise falls back to a stderr progress indicator.
 - SQLite files and the log file are created automatically; ensure the process has write access to this directory.
 - Failures to reach APIs or decode JSON raise descriptive errors after retry backoff controlled by the CLI flags.

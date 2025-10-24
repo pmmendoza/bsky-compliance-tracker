@@ -6,7 +6,7 @@ import json
 import logging
 import random
 import time
-from typing import Dict, Optional
+from typing import Dict, Iterable, List, Optional, Sequence
 
 import requests
 
@@ -47,6 +47,46 @@ class BlueskyClient:
                 last_error = exc
                 logger.warning(
                     "Request error for %s (attempt %d/%d): %s", url, attempt + 1, self.max_retries, exc
+                )
+                if attempt + 1 == self.max_retries:
+                    break
+                time.sleep(self._compute_backoff(attempt))
+                continue
+            if response.status_code in (429, 502, 503, 504):
+                logger.warning(
+                    "Received %s from %s (attempt %d/%d)",
+                    response.status_code,
+                    url,
+                    attempt + 1,
+                    self.max_retries,
+                )
+                last_error = HttpError(f"{response.status_code} from {url}")
+                if attempt + 1 == self.max_retries:
+                    break
+                time.sleep(self._compute_backoff(attempt))
+                continue
+            if not response.ok:
+                raise HttpError(f"GET {url} failed with status {response.status_code}: {response.text[:200]}")
+            try:
+                return response.json()
+            except json.JSONDecodeError as exc:
+                raise HttpError(f"Failed to decode JSON from {url}: {exc}") from exc
+        raise HttpError(f"GET {url} failed after retries") from last_error
+
+    def _get_json_with_params(self, path: str, params: Sequence[tuple[str, str]]) -> Dict:
+        url = APPVIEW_BASE + path
+        last_error: Optional[Exception] = None
+        for attempt in range(self.max_retries):
+            try:
+                response = self.session.get(url, params=list(params), timeout=self.timeout)
+            except requests.exceptions.RequestException as exc:  # type: ignore[attr-defined]
+                last_error = exc
+                logger.warning(
+                    "Request error for %s (attempt %d/%d): %s",
+                    url,
+                    attempt + 1,
+                    self.max_retries,
+                    exc,
                 )
                 if attempt + 1 == self.max_retries:
                     break
@@ -198,6 +238,17 @@ class BlueskyClient:
             cursor = data.get("cursor")
             if not cursor:
                 break
+
+    def get_posts(self, uris: Iterable[str]) -> List[Dict]:
+        uri_list = [uri for uri in uris if uri]
+        if not uri_list:
+            return []
+        params = [("uris", uri) for uri in uri_list]
+        payload = self._get_json_with_params("/xrpc/app.bsky.feed.getPosts", params)
+        posts = payload.get("posts")
+        if not isinstance(posts, list):
+            raise HttpError("Unexpected payload from app.bsky.feed.getPosts")
+        return posts
 
     def iter_reposts(self, uri: str):
         cursor: Optional[str] = None

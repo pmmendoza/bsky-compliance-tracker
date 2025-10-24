@@ -10,7 +10,7 @@ import sqlite3
 from pathlib import Path
 from typing import Dict, Optional, Sequence
 
-from .api import fetch_feed_retrievals, fetch_subscribers
+from .api import fetch_feed_retrievals, fetch_follow_counts, fetch_subscribers
 from .client import BlueskyClient, HttpError
 from .constants import (
     BOT_HANDLES,
@@ -27,12 +27,14 @@ from .database import (
     store_engagements,
     store_feed_retrievals,
     store_subscriber_snapshot,
+    store_subscriber_follow_counts,
 )
 from .engagements import (
     EngagementOptions,
     backfill_missing_engagement_texts,
     collect_engagements_for_post,
 )
+from .hydration import hydrate_posts
 from .progress import progress_iter
 from .repair import repair_empty_feed_requests
 from .utils import format_min_date, load_env_from_file, log_db_update, normalize_since
@@ -127,12 +129,74 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     last_engagement_ts = get_latest_timestamp(conn, "engagements", "timestamp")
     last_feed_ts = get_latest_timestamp(conn, "feed_requests", "timestamp")
 
+    run_summary = {
+        "subscriber_snapshot_count": 0,
+        "follower_counts_inserted": 0,
+        "follower_counts_updated": 0,
+        "follower_count_subscribers": 0,
+        "follower_count_failures": 0,
+        "engagement_rows_inserted": 0,
+        "feed_requests_inserted": 0,
+        "feed_repair_repaired": 0,
+        "feed_repair_remaining": 0,
+        "feed_repair_errors": 0,
+        "positions_matched": 0,
+        "positions_processed": 0,
+        "hydration_attempted": 0,
+        "hydration_hydrated": 0,
+        "hydration_not_found": 0,
+        "hydration_errors": 0,
+    }
+
     _log_latest("engagement", last_engagement_ts, now)
     _log_latest("feed retrieval", last_feed_ts, now)
 
     if subscriber_dids:
         store_subscriber_snapshot(conn, subscriber_dids, subscriber_handles, now)
-        logger.info("Recorded subscriber snapshot for %d DIDs", len(subscriber_dids))
+        snapshot_count = len(subscriber_dids)
+        run_summary["subscriber_snapshot_count"] = snapshot_count
+        logger.info("Recorded subscriber snapshot for %d DIDs", snapshot_count)
+        try:
+            follower_counts, follower_errors = fetch_follow_counts(
+                subscriber_dids, timeout=args.timeout, pause_seconds=0.2
+            )
+        except Exception:
+            logger.exception("Failed to fetch follower counts for subscribers")
+            follower_counts = {}
+            follower_errors = {}
+        if follower_counts:
+            inserted, updated = store_subscriber_follow_counts(conn, follower_counts, now)
+            run_summary["follower_count_subscribers"] = len(follower_counts)
+            run_summary["follower_counts_inserted"] = inserted
+            run_summary["follower_counts_updated"] = updated
+            logger.info(
+                "Recorded follower counts for %d subscribers (%d new rows, %d timestamp refreshes)",
+                len(follower_counts),
+                inserted,
+                updated,
+            )
+            log_db_update(
+                "follower_counts_fetch",
+                {
+                    "snapshot_ts": now.isoformat(),
+                    "subscribers": len(follower_counts),
+                    "inserted": inserted,
+                    "updated": updated,
+                },
+            )
+        if follower_errors:
+            fail_count = len(follower_errors)
+            run_summary["follower_count_failures"] = fail_count
+            logger.warning("Failed to fetch follower counts for %d subscribers", fail_count)
+            for did, message in list(follower_errors.items())[:5]:
+                logger.debug("Follower count fetch error for %s: %s", did, message)
+            log_db_update(
+                "follower_counts_fetch_errors",
+                {
+                    "snapshot_ts": now.isoformat(),
+                    "failures": fail_count,
+                },
+            )
 
     if not _confirm_large_backlog(args, now, last_engagement_ts, last_feed_ts):
         conn.close()
@@ -234,6 +298,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         bot_iter.close()
     logger.info("Finished engagement collection; inserted %d rows", total_inserts)
     print(f"Inserted {total_inserts} engagement rows into {db_path}")
+    run_summary["engagement_rows_inserted"] = total_inserts
 
     feed_inserts = 0
     repair_stats = None
@@ -262,6 +327,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             else:
                 logger.info("No feed retrieval events returned for the specified window")
         logger.info("Stored %d feed retrieval events", feed_inserts)
+        run_summary["feed_requests_inserted"] = feed_inserts
 
         if repair_window_days > 0:
             repair_since = now - dt.timedelta(days=repair_window_days)
@@ -280,6 +346,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 repair_stats.still_empty,
                 repair_stats.errors,
             )
+            run_summary["feed_repair_repaired"] = repair_stats.repaired_requests
+            run_summary["feed_repair_remaining"] = repair_stats.still_empty
+            run_summary["feed_repair_errors"] = repair_stats.errors
             repair_line = (
                 f"Feed repair: attempted {repair_stats.did_attempts} DIDs; "
                 f"repaired {repair_stats.repaired_requests}, remaining empty {repair_stats.still_empty}, "
@@ -294,6 +363,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     processed_positions = int(stats_dict.get("processed", 0))
     unmatched_positions = processed_positions - matched_positions
     avg_age_seconds = stats_dict.get("avg_age_seconds")
+    run_summary["positions_matched"] = matched_positions
+    run_summary["positions_processed"] = processed_positions
 
     if processed_positions:
         summary_line = (
@@ -321,6 +392,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(message)
         logger.info(message)
 
+    hydration_stats = hydrate_posts(conn, client)
+    run_summary["hydration_attempted"] = hydration_stats.get("attempted", 0)
+    run_summary["hydration_hydrated"] = hydration_stats.get("hydrated", 0)
+    run_summary["hydration_not_found"] = hydration_stats.get("not_found", 0)
+    run_summary["hydration_errors"] = hydration_stats.get("errors", 0)
+    logger.info(
+        "Hydrated posts: attempted=%d hydrated=%d not_found=%d errors=%d",
+        run_summary["hydration_attempted"],
+        run_summary["hydration_hydrated"],
+        run_summary["hydration_not_found"],
+        run_summary["hydration_errors"],
+    )
+
+    summary_text = _render_run_summary(run_summary)
+    logger.info("Run summary:\n%s", summary_text)
+    print("Run summary")
+    print(summary_text)
+
     log_db_update(
         "engagement_positions",
         {
@@ -347,6 +436,88 @@ def _log_latest(label: str, ts_value: Optional[dt.datetime], now: dt.datetime) -
         ts_value.isoformat(),
         delta_days,
     )
+
+
+def _render_run_summary(summary: Dict[str, int]) -> str:
+    sections = []
+
+    sections.append(
+        (
+            "Subscribers",
+            [
+                ("Snapshot count", summary["subscriber_snapshot_count"]),
+                ("Follower counts fetched", summary["follower_count_subscribers"]),
+                ("Follower fetch failures", summary["follower_count_failures"]),
+            ],
+        )
+    )
+
+    sections.append(
+        (
+            "Follower Counts",
+            [
+                ("New distinct counts", summary["follower_counts_inserted"]),
+                ("Timestamp refreshes", summary["follower_counts_updated"]),
+            ],
+        )
+    )
+
+    sections.append(
+        (
+            "Engagement & Feed",
+            [
+                ("Engagement rows inserted", summary["engagement_rows_inserted"]),
+                ("Feed retrievals stored", summary["feed_requests_inserted"]),
+                ("Feed repairs fixed", summary["feed_repair_repaired"]),
+                ("Feed repairs remaining", summary["feed_repair_remaining"]),
+                ("Feed repair errors", summary["feed_repair_errors"]),
+            ],
+        )
+    )
+
+    sections.append(
+        (
+            "Post Hydration",
+            [
+                ("URIs attempted", summary["hydration_attempted"]),
+                ("Hydrated successfully", summary["hydration_hydrated"]),
+                ("Marked not_found", summary["hydration_not_found"]),
+                ("Hydration errors", summary["hydration_errors"]),
+            ],
+        )
+    )
+
+    sections.append(
+        (
+            "Post Positions",
+            [
+                ("Matched engagements", summary["positions_matched"]),
+                ("Processed engagements", summary["positions_processed"]),
+            ],
+        )
+    )
+
+    rendered_sections = []
+    for title, rows in sections:
+        rendered_sections.append(f"{title}:")
+        rendered_sections.append(_format_table(["Metric", "Value"], rows))
+    return "\n\n".join(rendered_sections)
+
+
+def _format_table(headers: Sequence[str], rows: Sequence[Sequence[object]]) -> str:
+    str_rows = [[str(cell) for cell in row] for row in rows]
+    widths = [len(header) for header in headers]
+    for row in str_rows:
+        for idx, cell in enumerate(row):
+            widths[idx] = max(widths[idx], len(cell))
+
+    def _format_row(values: Sequence[str]) -> str:
+        return " | ".join(value.ljust(widths[idx]) for idx, value in enumerate(values))
+
+    header_line = _format_row(headers)
+    divider = "-+-".join("-" * width for width in widths)
+    data_lines = [_format_row(row) for row in str_rows]
+    return "\n".join([header_line, divider, *data_lines])
 
 
 def _confirm_large_backlog(args, now, last_engagement_ts, last_feed_ts) -> bool:

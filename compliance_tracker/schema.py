@@ -80,25 +80,98 @@ def ensure_feed_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS feed_request_posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             request_id INTEGER NOT NULL,
-            post_index INTEGER NOT NULL,
+            post_index INTEGER,
             post_uri TEXT,
-            post_author_did TEXT,
-            post_author_handle TEXT,
             post_json TEXT,
-            PRIMARY KEY (request_id, post_index),
+            UNIQUE (request_id, post_uri),
             FOREIGN KEY (request_id) REFERENCES feed_requests(request_id) ON DELETE CASCADE
         )
         """
     )
     conn.execute("PRAGMA foreign_keys = ON")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(feed_request_posts)")}
+    if "id" not in columns or "post_author_did" in columns or "post_author_handle" in columns:
+        _migrate_feed_request_posts(conn)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_feed_requests_did_time ON feed_requests(requester_did, timestamp)"
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_feed_requests_time ON feed_requests(timestamp)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_feed_request_posts_request_uri ON feed_request_posts(request_id, post_uri)"
+    )
+
+
+def ensure_posts_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS posts (
+            post_uri TEXT PRIMARY KEY,
+            cid TEXT,
+            author_did TEXT,
+            author_handle TEXT,
+            indexed_at TEXT,
+            created_at TEXT,
+            last_hydrated_at TEXT,
+            hydration_status TEXT,
+            hydration_error TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_author_did ON posts(author_did)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_posts_hydration_status ON posts(hydration_status, last_hydrated_at)"
+    )
+
+
+def ensure_follow_counts_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS subscriber_follow_counts (
+            did TEXT NOT NULL,
+            following_count INTEGER NOT NULL,
+            snapshot_ts TEXT NOT NULL,
+            PRIMARY KEY (did, following_count)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_follow_counts_snapshot
+        ON subscriber_follow_counts(snapshot_ts)
+        """
+    )
+
+
+def _migrate_feed_request_posts(conn: sqlite3.Connection) -> None:
+    conn.execute("ALTER TABLE feed_request_posts RENAME TO feed_request_posts_old")
+    conn.execute(
+        """
+        CREATE TABLE feed_request_posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id INTEGER NOT NULL,
+            post_index INTEGER,
+            post_uri TEXT,
+            post_json TEXT,
+            UNIQUE (request_id, post_uri),
+            FOREIGN KEY (request_id) REFERENCES feed_requests(request_id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO feed_request_posts (request_id, post_index, post_uri, post_json)
+        SELECT request_id, post_index, post_uri, post_json
+        FROM feed_request_posts_old
+        """
+    )
+    conn.execute("DROP TABLE feed_request_posts_old")
 
 
 def ensure_database(conn: sqlite3.Connection) -> None:
     ensure_engagements_schema(conn)
     ensure_feed_schema(conn)
+    ensure_posts_schema(conn)
+    ensure_follow_counts_schema(conn)
     conn.commit()

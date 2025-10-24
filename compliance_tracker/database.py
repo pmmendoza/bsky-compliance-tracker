@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import math
 import sqlite3
 from bisect import bisect_right
 from collections import defaultdict
@@ -76,16 +77,68 @@ def store_engagements(conn: sqlite3.Connection, rows: Iterable[EngagementRecord]
     return inserted
 
 
+def _coerce_payload_position(value: object) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return None
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            return int(stripped)
+        except ValueError:
+            try:
+                float_value = float(stripped)
+            except ValueError:
+                return None
+            if not math.isfinite(float_value) or not float_value.is_integer():
+                return None
+            return int(float_value)
+    return None
+
+
+def _upsert_post_placeholder(conn: sqlite3.Connection, post: Mapping) -> None:
+    post_uri = post.get("uri") or post.get("postUri")
+    if not post_uri:
+        return
+    cid = post.get("cid")
+    if not cid:
+        record = post.get("record")
+        if isinstance(record, Mapping):
+            cid = record.get("cid")
+    conn.execute(
+        """
+        INSERT INTO posts (post_uri, cid, hydration_status)
+        VALUES (?, ?, 'pending')
+        ON CONFLICT(post_uri) DO UPDATE SET
+            cid = COALESCE(posts.cid, excluded.cid),
+            hydration_status = CASE
+                WHEN posts.hydration_status IS NULL THEN 'pending'
+                ELSE posts.hydration_status
+            END
+        """,
+        (post_uri, cid),
+    )
+
+
 def store_feed_retrievals(conn: sqlite3.Connection, retrievals: Iterable[Mapping]) -> int:
-    """Persist feed requests; `post_index` is stored zero-based as received."""
+    """Persist feed requests; `post_index` mirrors the payload's position when available."""
 
     requests_sql = (
         "INSERT OR REPLACE INTO feed_requests (request_id, requester_did, algo, timestamp, posts_json) "
         "VALUES (?, ?, ?, ?, ?)"
     )
     posts_sql = (
-        "INSERT OR REPLACE INTO feed_request_posts (request_id, post_index, post_uri, post_author_did, post_author_handle, post_json) "
-        "VALUES (?, ?, ?, ?, ?, ?)"
+        "INSERT OR REPLACE INTO feed_request_posts (request_id, post_index, post_uri, post_json) "
+        "VALUES (?, ?, ?, ?)"
     )
     inserted = 0
     processed_ids: List[str] = []
@@ -104,18 +157,16 @@ def store_feed_retrievals(conn: sqlite3.Connection, retrievals: Iterable[Mapping
         for index, post in enumerate(posts):
             if not isinstance(post, dict):
                 post = {}
+            _upsert_post_placeholder(conn, post)
             post_uri = post.get("uri") or post.get("postUri")
-            post_author = post.get("author") or {}
-            post_author_did = post_author.get("did") or post.get("authorDid")
-            post_author_handle = post_author.get("handle") or post.get("authorHandle")
+            position_value = _coerce_payload_position(post.get("position"))
+            post_index_value = position_value if position_value is not None else None
             conn.execute(
                 posts_sql,
                 (
                     request_id,
-                    index,  # zero-based position as supplied by feed generator
+                    post_index_value,
                     post_uri,
-                    post_author_did,
-                    post_author_handle,
                     json.dumps(post),
                 ),
             )
@@ -134,6 +185,86 @@ def store_feed_retrievals(conn: sqlite3.Connection, retrievals: Iterable[Mapping
             },
         )
     return inserted
+
+
+def seed_posts_from_feed(conn: sqlite3.Connection) -> int:
+    """Insert placeholders for all URIs seen in feed_request_posts."""
+
+    cursor = conn.execute(
+        """
+        INSERT OR IGNORE INTO posts (post_uri, cid, hydration_status)
+        SELECT DISTINCT post_uri,
+               json_extract(post_json, '$.cid') AS cid,
+               'pending'
+        FROM feed_request_posts
+        WHERE post_uri IS NOT NULL
+        """
+    )
+    conn.commit()
+    return cursor.rowcount
+
+
+def get_post_uris_pending_hydration(conn: sqlite3.Connection, limit: Optional[int] = None) -> List[str]:
+    sql = (
+        "SELECT post_uri FROM posts "
+        "WHERE (author_did IS NULL OR author_handle IS NULL) "
+        "AND COALESCE(hydration_status, 'pending') != 'not_found' "
+        "ORDER BY COALESCE(last_hydrated_at, '') ASC, post_uri ASC"
+    )
+    params: Tuple = ()
+    if limit is not None:
+        sql += " LIMIT ?"
+        params = (limit,)
+    rows = conn.execute(sql, params).fetchall()
+    return [row[0] for row in rows]
+
+
+def update_posts_metadata(
+    conn: sqlite3.Connection,
+    metadata: Sequence[Mapping[str, Optional[str]]],
+    *,
+    hydrated_at: Optional[dt.datetime],
+) -> None:
+    if not metadata:
+        return
+    hydrated_ts = ensure_utc(hydrated_at).isoformat() if hydrated_at else None
+    rows = []
+    for item in metadata:
+        post_uri = item.get("post_uri")
+        if not post_uri:
+            continue
+        rows.append(
+            (
+                item.get("cid"),
+                item.get("author_did"),
+                item.get("author_handle"),
+                item.get("indexed_at"),
+                item.get("created_at"),
+                hydrated_ts,
+                item.get("hydration_status"),
+                item.get("hydration_error"),
+                post_uri,
+            )
+        )
+    if not rows:
+        return
+    conn.executemany(
+        """
+        UPDATE posts
+        SET
+            cid = COALESCE(?, cid),
+            author_did = ?,
+            author_handle = ?,
+            indexed_at = COALESCE(?, indexed_at),
+            created_at = COALESCE(?, created_at),
+            last_hydrated_at = ?,
+            hydration_status = ?,
+            hydration_error = ?
+        WHERE post_uri = ?
+        """,
+        rows,
+    )
+    conn.commit()
 
 
 def store_subscriber_snapshot(
@@ -161,6 +292,60 @@ def store_subscriber_snapshot(
             "subscriber_count": len(rows),
         },
     )
+
+
+def store_subscriber_follow_counts(
+    conn: sqlite3.Connection,
+    follow_counts: Mapping[str, int],
+    snapshot_dt: dt.datetime,
+) -> Tuple[int, int]:
+    if not follow_counts:
+        return 0, 0
+    snapshot_ts = ensure_utc(snapshot_dt).isoformat()
+    updated = 0
+    inserted = 0
+    for did, count in follow_counts.items():
+        if count is None:
+            continue
+        cursor = conn.execute(
+            "UPDATE subscriber_follow_counts SET snapshot_ts = ? WHERE did = ? AND following_count = ?",
+            (snapshot_ts, did, count),
+        )
+        if cursor.rowcount:
+            updated += cursor.rowcount
+            continue
+        conn.execute(
+            "INSERT INTO subscriber_follow_counts (did, following_count, snapshot_ts) VALUES (?, ?, ?)",
+            (did, count, snapshot_ts),
+        )
+        inserted += 1
+    conn.commit()
+    if inserted or updated:
+        log_db_update(
+            "subscriber_follow_counts",
+            {
+                "snapshot_ts": snapshot_ts,
+                "updated": updated,
+                "inserted": inserted,
+                "distinct_dids": sorted(follow_counts.keys()),
+            },
+        )
+    return inserted, updated
+
+
+def get_latest_follower_counts(conn: sqlite3.Connection) -> Dict[str, int]:
+    rows = conn.execute(
+        """
+        SELECT sfc.did, sfc.following_count
+        FROM subscriber_follow_counts sfc
+        JOIN (
+            SELECT did, MAX(snapshot_ts) AS latest_ts
+            FROM subscriber_follow_counts
+            GROUP BY did
+        ) latest ON latest.did = sfc.did AND latest.latest_ts = sfc.snapshot_ts
+        """
+    ).fetchall()
+    return {did: count for did, count in rows}
 
 
 def get_latest_timestamp(conn: sqlite3.Connection, table: str, column: str) -> Optional[dt.datetime]:
@@ -206,6 +391,24 @@ class PositionMatchStats:
         for code, count in self.status_counts.items():
             payload[f"status_{code}"] = float(count)
         return payload
+
+
+@dataclass
+class PostIndexRebuildStats:
+    scanned: int = 0
+    updated: int = 0
+    missing_position: int = 0
+    invalid_position: int = 0
+    parse_errors: int = 0
+
+    def to_dict(self) -> Dict[str, int]:
+        return {
+            "scanned": self.scanned,
+            "updated": self.updated,
+            "missing_position": self.missing_position,
+            "invalid_position": self.invalid_position,
+            "parse_errors": self.parse_errors,
+        }
 
 
 def match_post_positions(
@@ -359,6 +562,47 @@ def match_post_positions(
     return stats
 
 
+def rebuild_post_indices_from_payload(conn: sqlite3.Connection) -> PostIndexRebuildStats:
+    stats = PostIndexRebuildStats()
+    updates: List[Tuple[Optional[int], int]] = []
+    rows = conn.execute(
+        "SELECT rowid, post_json, post_index FROM feed_request_posts"
+    ).fetchall()
+    for rowid, post_json, existing_index in rows:
+        stats.scanned += 1
+        if not post_json:
+            stats.missing_position += 1
+            continue
+        try:
+            payload = json.loads(post_json)
+        except (TypeError, json.JSONDecodeError):
+            stats.parse_errors += 1
+            continue
+        if not isinstance(payload, dict):
+            stats.parse_errors += 1
+            continue
+        position = payload.get("position")
+        coerced = _coerce_payload_position(position)
+        if coerced is None:
+            if position is None:
+                stats.missing_position += 1
+            else:
+                stats.invalid_position += 1
+            continue
+        if existing_index == coerced:
+            continue
+        updates.append((coerced, rowid))
+    if updates:
+        conn.executemany(
+            "UPDATE feed_request_posts SET post_index = ? WHERE rowid = ?",
+            updates,
+        )
+        stats.updated = len(updates)
+        conn.commit()
+        log_db_update("feed_request_posts_rebuild", stats.to_dict())
+    return stats
+
+
 @dataclass
 class FeedCacheEntry:
     request_id: int
@@ -377,7 +621,7 @@ def _load_feed_cache(conn: sqlite3.Connection, did: str) -> FeedCache:
         """
         SELECT fr.request_id,
                fr.timestamp,
-               COUNT(frp.post_index) AS post_count
+               COUNT(frp.id) AS post_count
         FROM feed_requests fr
         LEFT JOIN feed_request_posts frp ON fr.request_id = frp.request_id
         WHERE fr.requester_did = ?
@@ -411,7 +655,11 @@ def _load_post_mapping(conn: sqlite3.Connection, request_id: int) -> Dict[str, i
         "SELECT post_uri, post_index FROM feed_request_posts WHERE request_id = ?",
         (request_id,),
     ).fetchall()
-    return {post_uri: int(post_index) for post_uri, post_index in rows if post_uri}
+    mapping: Dict[str, int] = {}
+    for post_uri, post_index in rows:
+        if post_uri and post_index is not None:
+            mapping[post_uri] = int(post_index)
+    return mapping
 
 
 def _update_position(
