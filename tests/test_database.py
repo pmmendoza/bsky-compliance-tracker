@@ -19,6 +19,7 @@ from compliance_tracker.database import (
     store_engagements,
     store_feed_retrievals,
     store_subscriber_follow_counts,
+    store_subscriber_snapshot,
 )
 from compliance_tracker.engagements import EngagementRecord
 from compliance_tracker.progress import progress_iter
@@ -346,3 +347,35 @@ def test_get_post_uris_pending_hydration_returns_only_unhydrated():
 
     pending = get_post_uris_pending_hydration(conn)
     assert pending == ["at://example/post1"]
+
+
+def test_store_subscriber_snapshot_change_tracking():
+    conn = make_connection()
+    did = "did:example:sub"
+    ts1 = dt.datetime(2025, 10, 24, 12, 0, tzinfo=dt.timezone.utc)
+    store_subscriber_snapshot(conn, {did}, {did: "handle.one"}, ts1)
+    row = conn.execute(
+        "SELECT snapshot_ts, last_checked_ts, did, handle FROM subscriber_snapshots"
+    ).fetchone()
+    assert row == (ts1.isoformat(), ts1.isoformat(), did, "handle.one")
+
+    ts2 = ts1 + dt.timedelta(hours=6)
+    store_subscriber_snapshot(conn, {did}, {did: "handle.one"}, ts2)
+    rows = conn.execute(
+        "SELECT snapshot_ts, last_checked_ts, handle FROM subscriber_snapshots"
+        " WHERE did = ? ORDER BY snapshot_ts",
+        (did,),
+    ).fetchall()
+    assert rows == [(ts1.isoformat(), ts2.isoformat(), "handle.one")]
+
+    ts3 = ts2 + dt.timedelta(hours=6)
+    store_subscriber_snapshot(conn, {did}, {did: "handle.two"}, ts3)
+    rows = conn.execute(
+        "SELECT snapshot_ts, last_checked_ts, handle FROM subscriber_snapshots"
+        " WHERE did = ? ORDER BY snapshot_ts",
+        (did,),
+    ).fetchall()
+    assert rows == [
+        (ts1.isoformat(), ts2.isoformat(), "handle.one"),
+        (ts3.isoformat(), ts3.isoformat(), "handle.two"),
+    ]

@@ -74,6 +74,13 @@
   - [x] Instructions describe prerequisites (API keys, rate-limit expectations).
   - [x] Example queries included (README section “Follower tracking”).
 
+### 7. Snapshot Change Tracking
+- **Task**: Convert `subscriber_snapshots` into a change-driven table so each DID keeps a single row per distinct state; only insert when the subscriber’s data changes and otherwise refresh a `last_checked_ts`.
+- **DoD**:
+  - [x] Schema adds `last_checked_ts` (or equivalent) and existing data is migrated safely by collapsing historical rows per DID into the new format.
+  - [x] Ingestion updates an existing row when nothing changed and inserts a new row only when the snapshot differs.
+  - [x] Tests cover unchanged vs. changed subscribers and verify historical data still records state transitions after migration.
+
 ### Optional Backlog Tasks
 - Differential alerting when follower counts change beyond a threshold.
 - Historical trend dashboard (e.g., in Metabase/Data Studio).

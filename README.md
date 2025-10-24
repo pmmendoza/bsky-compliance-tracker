@@ -112,6 +112,7 @@ Run `python compliance-tracker/collect_engagements.py --help` for the full list.
 | Column | Type | Notes |
 | --- | --- | --- |
 | snapshot_ts | TEXT | UTC ISO timestamp when the snapshot was recorded |
+| last_checked_ts | TEXT | Most recent verification timestamp for this state |
 | did | TEXT | Subscriber DID present in the snapshot |
 | handle | TEXT | Handle from the subscriber endpoint (nullable) |
 

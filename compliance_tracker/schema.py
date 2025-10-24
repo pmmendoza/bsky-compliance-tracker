@@ -125,6 +125,35 @@ def ensure_posts_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def ensure_subscriber_schema(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='subscriber_snapshots'"
+    ).fetchall()
+    if not rows:
+        conn.execute(
+            """
+            CREATE TABLE subscriber_snapshots (
+                snapshot_ts TEXT NOT NULL,
+                last_checked_ts TEXT NOT NULL,
+                did TEXT NOT NULL,
+                handle TEXT,
+                PRIMARY KEY (did, snapshot_ts)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_subscriber_snapshots_did ON subscriber_snapshots(did)"
+        )
+        return
+
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(subscriber_snapshots)")}
+    if "last_checked_ts" not in columns:
+        _migrate_subscriber_snapshots(conn)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_subscriber_snapshots_did ON subscriber_snapshots(did)"
+    )
+
+
 def ensure_follow_counts_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -169,9 +198,65 @@ def _migrate_feed_request_posts(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE feed_request_posts_old")
 
 
+def _migrate_subscriber_snapshots(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        "SELECT snapshot_ts, did, handle FROM subscriber_snapshots ORDER BY did, snapshot_ts"
+    ).fetchall()
+    conn.execute("ALTER TABLE subscriber_snapshots RENAME TO subscriber_snapshots_old")
+    conn.execute(
+        """
+        CREATE TABLE subscriber_snapshots (
+            snapshot_ts TEXT NOT NULL,
+            last_checked_ts TEXT NOT NULL,
+            did TEXT NOT NULL,
+            handle TEXT,
+            PRIMARY KEY (did, snapshot_ts)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_subscriber_snapshots_did ON subscriber_snapshots(did)"
+    )
+
+    aggregated = []
+    current_did = None
+    current_handle = None
+    start_ts = None
+    last_ts = None
+
+    for snapshot_ts, did, handle in rows:
+        if did != current_did:
+            if current_did is not None:
+                aggregated.append((current_did, current_handle, start_ts, last_ts))
+            current_did = did
+            current_handle = handle
+            start_ts = snapshot_ts
+            last_ts = snapshot_ts
+            continue
+        if handle != current_handle:
+            aggregated.append((current_did, current_handle, start_ts, last_ts))
+            current_handle = handle
+            start_ts = snapshot_ts
+            last_ts = snapshot_ts
+        else:
+            last_ts = snapshot_ts
+
+    if current_did is not None:
+        aggregated.append((current_did, current_handle, start_ts, last_ts))
+
+    if aggregated:
+        conn.executemany(
+            "INSERT INTO subscriber_snapshots (snapshot_ts, last_checked_ts, did, handle) VALUES (?, ?, ?, ?)",
+            [(start_ts, last_ts, did, handle) for did, handle, start_ts, last_ts in aggregated],
+        )
+
+    conn.execute("DROP TABLE subscriber_snapshots_old")
+
+
 def ensure_database(conn: sqlite3.Connection) -> None:
     ensure_engagements_schema(conn)
     ensure_feed_schema(conn)
     ensure_posts_schema(conn)
+    ensure_subscriber_schema(conn)
     ensure_follow_counts_schema(conn)
     conn.commit()

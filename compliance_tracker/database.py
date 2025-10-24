@@ -276,20 +276,45 @@ def store_subscriber_snapshot(
     if not subscriber_dids:
         return
     snapshot_ts = ensure_utc(snapshot_dt).isoformat()
-    rows = [
-        (snapshot_ts, did, subscriber_handles.get(did))
-        for did in sorted(subscriber_dids)
-    ]
-    conn.executemany(
-        "INSERT OR REPLACE INTO subscriber_snapshots (snapshot_ts, did, handle) VALUES (?, ?, ?)",
-        rows,
-    )
+    did_list = sorted(subscriber_dids)
+    placeholders = ",".join(["?"] * len(did_list))
+    existing: Dict[str, Tuple[str, str]] = {}
+    if did_list:
+        query = (
+            f"SELECT did, handle, snapshot_ts FROM subscriber_snapshots "
+            f"WHERE did IN ({placeholders}) ORDER BY did, snapshot_ts DESC"
+        )
+        rows = conn.execute(query, did_list).fetchall()
+        for did, handle, existing_snapshot_ts in rows:
+            if did not in existing:
+                existing[did] = (handle, existing_snapshot_ts)
+
+    inserted = 0
+    updated = 0
+    for did in did_list:
+        handle = subscriber_handles.get(did)
+        current = existing.get(did)
+        if current and current[0] == handle:
+            conn.execute(
+                "UPDATE subscriber_snapshots SET last_checked_ts = ? WHERE did = ? AND snapshot_ts = ?",
+                (snapshot_ts, did, current[1]),
+            )
+            updated += 1
+        else:
+            conn.execute(
+                "INSERT INTO subscriber_snapshots (snapshot_ts, last_checked_ts, did, handle) VALUES (?, ?, ?, ?)",
+                (snapshot_ts, snapshot_ts, did, handle),
+            )
+            inserted += 1
+
     conn.commit()
     log_db_update(
         "subscriber_snapshots",
         {
             "snapshot_ts": snapshot_ts,
-            "subscriber_count": len(rows),
+            "subscriber_count": len(did_list),
+            "inserted": inserted,
+            "updated": updated,
         },
     )
 
